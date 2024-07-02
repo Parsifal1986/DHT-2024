@@ -22,11 +22,12 @@ func init() {
 const M int = 160
 
 type Node struct {
-	Addr      string
-	online    bool
-	innet     bool
-	innetLock sync.RWMutex
-	finished  chan int
+	Addr             string
+	online           bool
+	innet            bool
+	innetLock        sync.RWMutex
+	fixfinished      chan int
+	stablizefinished chan int
 
 	listener net.Listener
 	server   *rpc.Server
@@ -98,7 +99,8 @@ func (node *Node) Init(addr string) {
 		node.fingerTable[i] = node.Addr
 	}
 	node.fingerTableLock.Unlock()
-	node.finished = make(chan int)
+	node.stablizefinished = make(chan int)
+	node.fixfinished = make(chan int)
 	node.successorlistLock.Lock()
 	node.successorlist = make([]string, 10)
 	node.successorlist[0] = addr
@@ -157,27 +159,27 @@ func (node *Node) Ping(_ string, _ *struct{}) error {
 }
 
 func (node *Node) FindSuccessor(id big.Int, reply *string) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
-	logrus.Info(node.Addr, " Safe innet lock")
+	// node.innetLock.RLock()
+	// defer node.innetLock.RUnlock()
 	if !node.innet {
 		return errors.New("hasn't create a net yet")
 	}
 
 	if id.Cmp(HashString(node.Addr)) == 0 {
 		node.fingerTableLock.RLock()
-		// logrus.Info(node.Addr, " Safe fingertable lock")
 		err := node.RemoteCall(node.fingerTable[0], "Node.Ping", new(string), nil)
 		node.fingerTableLock.RUnlock()
-		// logrus.Info(node.Addr, " Safe fingertable Unlock")
 		if err != nil {
 			logrus.Error(err)
 			flag := false
-			node.successorlistLock.Lock()
 			for i := 0; i < 10; i++ {
+				node.successorlistLock.RLock()
 				possible_successor := node.successorlist[0]
+				node.successorlistLock.RUnlock()
 				if possible_successor == "" {
+					node.successorlistLock.Lock()
 					copy(node.successorlist, node.successorlist[1:])
+					node.successorlistLock.Unlock()
 					continue
 				}
 				ok := node.RemoteCall(possible_successor, "Node.Ping", new(string), nil)
@@ -185,17 +187,19 @@ func (node *Node) FindSuccessor(id big.Int, reply *string) error {
 					node.fingerTableLock.Lock()
 					node.fingerTable[0] = possible_successor
 					node.fingerTableLock.Unlock()
-					node.successorlistLock.Unlock()
 					flag = true
 					node.RemoteCall(possible_successor, "Node.ChangePredecessor", node.Addr, nil)
 					node.RemoteCall(possible_successor, "Node.MergeBackupData", new(string), nil)
+					node.dataLock.RLock()
 					node.RemoteCall(possible_successor, "Node.BackupDataFrom", node.data, nil)
+					node.dataLock.RUnlock()
 					break
 				}
+				node.successorlistLock.Lock()
 				copy(node.successorlist, node.successorlist[1:])
+				node.successorlistLock.Unlock()
 			}
 			if !flag {
-				node.successorlistLock.Unlock()
 				return errors.New("lost successor connect")
 			}
 		}
@@ -206,13 +210,17 @@ func (node *Node) FindSuccessor(id big.Int, reply *string) error {
 	}
 
 	prime := new(string)
+	ret := new(string)
 	*prime = node.Addr
 	node.FindPredecessor(id, prime)
-	node.RemoteCall(*prime, "Node.FindSuccessor", HashString(*prime), reply)
+	node.RemoteCall(*prime, "Node.FindSuccessor", HashString(*prime), ret)
+	*reply = *ret
 	return nil
 }
 
 func (node *Node) FindPredecessor(id big.Int, reply *string) error {
+	logrus.Infof("%s FindPredecessor %v", node.Addr, &id)
+
 	node.innetLock.RLock()
 	defer node.innetLock.RUnlock()
 	if !node.innet {
@@ -306,10 +314,11 @@ func (node *Node) ChangePredecessor(addr string, _ *struct{}) error {
 }
 
 func (node *Node) Stablize() {
+	defer close(node.stablizefinished)
 	for {
+		logrus.Info("stablize ", node.Addr)
 		node.innetLock.RLock()
 		if !node.innet {
-			defer close(node.finished)
 			node.innetLock.RUnlock()
 			return
 		}
@@ -360,8 +369,11 @@ func (node *Node) Notify(addr string, _ *struct{}) error {
 
 func (node *Node) FixFinger() {
 	pos := 0
+	defer close(node.fixfinished)
 	for {
+		logrus.Info(node.Addr, "fix fingertable before innnet lock ok")
 		node.innetLock.RLock()
+		logrus.Info(node.Addr, "fix fingertable after innet lock ok")
 		if !node.innet {
 			node.innetLock.RUnlock()
 			return
@@ -369,9 +381,13 @@ func (node *Node) FixFinger() {
 		node.innetLock.RUnlock()
 
 		pos = (pos + 3) % 160
+
+		logrus.Info(node.Addr, "fix fingertable", pos)
 		new_finger := new(string)
 		node.FindSuccessor(*new(big.Int).Mod(new(big.Int).Add(HashString(node.Addr), new(big.Int).Exp(big.NewInt(2), big.NewInt(int64(pos)), nil)), &size), new_finger)
+		logrus.Info(node.Addr, "fix fingertable before fingertablelock ok")
 		node.fingerTableLock.Lock()
+		logrus.Info(node.Addr, "fix fingertable after fingertablelock ok")
 		node.fingerTable[pos] = *new_finger
 		node.fingerTableLock.Unlock()
 		time.Sleep(50 * time.Millisecond)
@@ -577,14 +593,15 @@ func (node *Node) Join(addr string) bool {
 
 func (node *Node) Quit() {
 	logrus.Infof("Quit %s", node.Addr)
-	if node.online {
+	if !node.online {
 		return
 	}
 
 	node.innetLock.Lock()
 	node.innet = false
 	node.innetLock.Unlock()
-	<-node.finished
+	<-node.stablizefinished
+	<-node.fixfinished
 
 	node.fingerTableLock.RLock()
 	successor := node.fingerTable[0]
@@ -596,6 +613,11 @@ func (node *Node) Quit() {
 
 	if successor != node.Addr {
 		node.RemoteCall(successor, "Node.MergeBackupData", new(string), nil)
+
+		node.backupdataLock.RLock()
+		node.RemoteCall(successor, "Node.BackupDataFrom", node.backupdata, nil)
+		node.backupdataLock.RUnlock()
+
 		if predecessor != "" {
 			node.RemoteCall(successor, "Node.ChangePredecessor", predecessor, nil)
 			node.RemoteCall(predecessor, "Node.ChangeSuccessor", successor, nil)
@@ -607,14 +629,16 @@ func (node *Node) Quit() {
 
 func (node *Node) ForceQuit() {
 	logrus.Info("ForceQuit ", node.Addr)
-	if node.online {
+	if !node.online {
 		return
 	}
 
 	node.innetLock.Lock()
+	logrus.Info("ForceQuit Step 1 good ", node.Addr)
 	node.innet = false
 	node.innetLock.Unlock()
-	<-node.finished
+	<-node.stablizefinished
+	<-node.fixfinished
 
 	node.StopRPCServer()
 }
@@ -629,7 +653,7 @@ func (node *Node) Put(key string, value string) bool {
 }
 
 func (node *Node) Get(key string) (bool, string) {
-	logrus.Infof("Get %s", key)
+	logrus.Infof("%s Get %s", node.Addr, key)
 	targetnode, data := new(string), new(string)
 
 	err := node.FindSuccessor(*HashString(key), targetnode)
