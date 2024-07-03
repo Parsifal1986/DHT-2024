@@ -210,11 +210,11 @@ func (node *Node) FindSuccessor(id big.Int, reply *string) error {
 	}
 
 	prime := new(string)
-	ret := new(string)
 	*prime = node.Addr
 	node.FindPredecessor(id, prime)
-	node.RemoteCall(*prime, "Node.FindSuccessor", HashString(*prime), ret)
-	*reply = *ret
+	if err := node.RemoteCall(*prime, "Node.FindSuccessor", HashString(*prime), reply); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -637,8 +637,6 @@ func (node *Node) ForceQuit() {
 	logrus.Info("ForceQuit Step 1 good ", node.Addr)
 	node.innet = false
 	node.innetLock.Unlock()
-	<-node.stablizefinished
-	<-node.fixfinished
 
 	node.StopRPCServer()
 }
