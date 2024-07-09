@@ -28,6 +28,7 @@ type Node struct {
 	innetLock        sync.RWMutex
 	fixfinished      chan int
 	stablizefinished chan int
+	threadfinished   sync.WaitGroup
 
 	listener net.Listener
 	server   *rpc.Server
@@ -141,17 +142,14 @@ func (node *Node) Ping(_ string, _ *struct{}) error {
 }
 
 func (node *Node) FindSuccessor(id big.Int, reply *string) error {
-	node.innetLock.RLock()
-	if !node.innet {
-		node.innetLock.RUnlock()
-		return errors.New("hasn't create a net yet")
-	}
-	node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	if id.Cmp(HashString(node.Addr)) == 0 {
 		node.fingerTableLock.RLock()
-		err := node.RemoteCall(node.fingerTable[0], "Node.Ping", new(string), nil)
+		successor := node.fingerTable[0]
 		node.fingerTableLock.RUnlock()
+		err := node.RemoteCall(successor, "Node.Ping", new(string), nil)
 		if err != nil {
 			logrus.Error(err)
 			flag := false
@@ -174,8 +172,9 @@ func (node *Node) FindSuccessor(id big.Int, reply *string) error {
 					node.RemoteCall(possible_successor, "Node.ChangePredecessor", node.Addr, nil)
 					node.RemoteCall(possible_successor, "Node.MergeBackupData", new(string), nil)
 					node.dataLock.RLock()
-					node.RemoteCall(possible_successor, "Node.BackupDataFrom", node.data, nil)
+					tmpdata := node.data
 					node.dataLock.RUnlock()
+					node.RemoteCall(possible_successor, "Node.BackupDataFrom", tmpdata, nil)
 					break
 				}
 				node.successorlistLock.Lock()
@@ -202,12 +201,8 @@ func (node *Node) FindSuccessor(id big.Int, reply *string) error {
 }
 
 func (node *Node) FindPredecessor(id big.Int, reply *string) error {
-	node.innetLock.RLock()
-	if !node.innet {
-		node.innetLock.RUnlock()
-		return errors.New("hasn't create a net yet")
-	}
-	node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	if id.Cmp(HashString(node.Addr)) == 0 {
 		node.predecessorLock.RLock()
@@ -242,36 +237,29 @@ func (node *Node) FindPredecessor(id big.Int, reply *string) error {
 }
 
 func (node *Node) ClosestPrecedingFinger(id big.Int, reply *string) error {
-	node.innetLock.RLock()
-	if !node.innet {
-		node.innetLock.RUnlock()
-		return errors.New("hasn't create a net yet")
-	}
-	node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	var cur, next, target *big.Int
 	cur, target = HashString(node.Addr), &id
 
 	for i := M - 1; i >= 0; i-- {
 		node.fingerTableLock.RLock()
-		if node.fingerTable[i] == "" {
-			node.fingerTableLock.RUnlock()
+		successor := node.fingerTable[i]
+		node.fingerTableLock.RUnlock()
+		if successor == "" {
 			continue
 		}
 
 		next = HashString(node.fingerTable[i])
-		node.fingerTableLock.RUnlock()
 
 		if In(next, cur, target, false, false) {
-			node.fingerTableLock.RLock()
-			err := node.RemoteCall(node.fingerTable[i], "Node.Ping", new(string), nil)
+			err := node.RemoteCall(successor, "Node.Ping", new(string), nil)
 			if err != nil {
 				logrus.Error(err)
-				node.fingerTableLock.RUnlock()
 				continue
 			}
-			*reply = node.fingerTable[i]
-			node.fingerTableLock.RUnlock()
+			*reply = successor
 			return nil
 		}
 	}
@@ -281,8 +269,8 @@ func (node *Node) ClosestPrecedingFinger(id big.Int, reply *string) error {
 }
 
 func (node *Node) ChangeSuccessor(addr string, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.fingerTableLock.Lock()
 	node.fingerTable[0] = addr
@@ -291,8 +279,8 @@ func (node *Node) ChangeSuccessor(addr string, _ *struct{}) error {
 }
 
 func (node *Node) ChangePredecessor(addr string, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.predecessorLock.Lock()
 	node.predecessor = addr
@@ -313,39 +301,42 @@ func (node *Node) Stablize() {
 
 		possible_successor := new(string)
 		node.fingerTableLock.RLock()
-		err := node.RemoteCall(node.fingerTable[0], "Node.FindPredecessor", HashString(node.fingerTable[0]), possible_successor)
+		successor := node.fingerTable[0]
 		node.fingerTableLock.RUnlock()
+		err := node.RemoteCall(successor, "Node.FindPredecessor", HashString(successor), possible_successor)
 		if err != nil {
 			logrus.Error(err)
 			node.FindSuccessor(*HashString(node.Addr), new(string))
 		}
 
-		node.fingerTableLock.Lock()
-		if In(HashString(*possible_successor), HashString(node.Addr), HashString(node.fingerTable[0]), false, false) {
+		if In(HashString(*possible_successor), HashString(node.Addr), HashString(successor), false, false) {
+			node.fingerTableLock.Lock()
 			node.fingerTable[0] = *possible_successor
+			successor = *possible_successor
+			node.fingerTableLock.Unlock()
 
 			node.dataLock.RLock()
-			node.RemoteCall(node.fingerTable[0], "Node.BackupDataFrom", node.data, nil)
+			tmpdata := node.data
 			node.dataLock.RUnlock()
+			node.RemoteCall(successor, "Node.BackupDataFrom", tmpdata, nil)
 		}
-		node.RemoteCall(node.fingerTable[0], "Node.Notify", node.Addr, nil)
+		node.RemoteCall(successor, "Node.Notify", node.Addr, nil)
 		NextSuccessorlist := make([]string, 10)
-		err = node.RemoteCall(node.fingerTable[0], "Node.GetSuccessorlist", new(string), &NextSuccessorlist)
+		err = node.RemoteCall(successor, "Node.GetSuccessorlist", new(string), &NextSuccessorlist)
 		if err == nil {
 			node.successorlistLock.Lock()
-			node.successorlist[0] = node.fingerTable[0]
+			node.successorlist[0] = successor
 			copy(node.successorlist[1:], NextSuccessorlist[:9])
 			node.successorlistLock.Unlock()
 		}
-		node.fingerTableLock.Unlock()
 
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (node *Node) Notify(addr string, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 	node.predecessorLock.Lock()
 	if node.predecessor == "" || In(HashString(addr), HashString(node.predecessor), HashString(node.Addr), false, false) {
 		node.predecessor = addr
@@ -376,30 +367,30 @@ func (node *Node) FixFinger() {
 	}
 }
 
-// func (node *Node) test() {
-// 	for {
-// 		node.innetLock.RLock()
-// 		if !node.innet {
-// 			node.innetLock.RUnlock()
-// 			return
-// 		}
-// 		node.innetLock.RUnlock()
+func (node *Node) test() {
+	for {
+		node.innetLock.RLock()
+		if !node.innet {
+			node.innetLock.RUnlock()
+			return
+		}
+		node.innetLock.RUnlock()
 
-// 		node.fingerTableLock.RLock()
-// 		node.predecessorLock.RLock()
-// 		logrus.Infof("Node Data: Addr: %v Successor %v Predecessor %v Hashnum %v", node.Addr, node.fingerTable[0], node.predecessor, HashString(node.Addr))
-// 		node.successorlistLock.RLock()
-// 		logrus.Info("successorlist", node.successorlist)
-// 		node.successorlistLock.RUnlock()
-// 		node.fingerTableLock.RUnlock()
-// 		node.predecessorLock.RUnlock()
-// 		time.Sleep(100 * time.Millisecond)
-// 	}
-// }
+		node.fingerTableLock.RLock()
+		node.predecessorLock.RLock()
+		logrus.Infof("Node Data: Addr: %v Successor %v Predecessor %v Hashnum %v", node.Addr, node.fingerTable[0], node.predecessor, HashString(node.Addr))
+		node.successorlistLock.RLock()
+		logrus.Info("successorlist", node.successorlist)
+		node.successorlistLock.RUnlock()
+		node.fingerTableLock.RUnlock()
+		node.predecessorLock.RUnlock()
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 
 func (node *Node) MergeBackupData(_ string, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.dataLock.Lock()
 	node.backupdataLock.RLock()
@@ -410,15 +401,16 @@ func (node *Node) MergeBackupData(_ string, _ *struct{}) error {
 	node.dataLock.Unlock()
 
 	node.dataLock.RLock()
-	node.RemoteCall(node.fingerTable[0], "Node.BackupDataFrom", node.data, nil)
+	tmpdata := node.data
 	node.dataLock.RUnlock()
+	node.RemoteCall(node.fingerTable[0], "Node.BackupDataFrom", tmpdata, nil)
 
 	return nil
 }
 
 func (node *Node) UpdateDataFor(addr string, reply *map[string]string) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.dataLock.RLock()
 	for key, value := range node.data {
@@ -433,8 +425,8 @@ func (node *Node) UpdateDataFor(addr string, reply *map[string]string) error {
 }
 
 func (node *Node) BackupDataFrom(backupdata map[string]string, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.backupdataLock.Lock()
 	node.backupdata = backupdata
@@ -444,8 +436,8 @@ func (node *Node) BackupDataFrom(backupdata map[string]string, _ *struct{}) erro
 }
 
 func (node *Node) BackupData(data Pair, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.backupdataLock.Lock()
 	node.backupdata[data.Key] = data.Value
@@ -455,8 +447,8 @@ func (node *Node) BackupData(data Pair, _ *struct{}) error {
 }
 
 func (node *Node) GetSuccessorlist(_ string, reply *[]string) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.successorlistLock.RLock()
 	*reply = node.successorlist
@@ -466,8 +458,8 @@ func (node *Node) GetSuccessorlist(_ string, reply *[]string) error {
 }
 
 func (node *Node) GetData(key string, reply *string) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.dataLock.RLock()
 	value, ok := node.data[key]
@@ -481,23 +473,24 @@ func (node *Node) GetData(key string, reply *string) error {
 }
 
 func (node *Node) PutData(data Pair, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.dataLock.Lock()
 	node.data[data.Key] = data.Value
 	node.dataLock.Unlock()
 
 	node.fingerTableLock.RLock()
-	node.RemoteCall(node.fingerTable[0], "Node.BackupData", data, nil)
+	successor := node.fingerTable[0]
 	node.fingerTableLock.RUnlock()
+	node.RemoteCall(successor, "Node.BackupData", data, nil)
 
 	return nil
 }
 
 func (node *Node) DeleteData(key string, _ *struct{}) error {
-	node.innetLock.RLock()
-	defer node.innetLock.RUnlock()
+	node.threadfinished.Add(1)
+	defer node.threadfinished.Done()
 
 	node.dataLock.RLock()
 	_, ok := node.data[key]
@@ -555,14 +548,16 @@ func (node *Node) Create() {
 	node.innetLock.Unlock()
 	go node.Stablize()
 	go node.FixFinger()
-	// go node.test()
+	go node.test()
 }
 
 func (node *Node) Join(addr string) bool {
 	logrus.Infof("Join %s", addr)
 	if addr != "" {
+		successor := new(string)
+		err := node.RemoteCall(addr, "Node.FindSuccessor", HashString(node.Addr), successor)
 		node.fingerTableLock.Lock()
-		err := node.RemoteCall(addr, "Node.FindSuccessor", HashString(node.Addr), &node.fingerTable[0])
+		node.fingerTable[0] = *successor
 		node.fingerTableLock.Unlock()
 
 		if err != nil {
@@ -570,15 +565,13 @@ func (node *Node) Join(addr string) bool {
 			return false
 		}
 
-		node.fingerTableLock.RLock()
+		tmpdata := make(map[string]string)
+		node.RemoteCall(*successor, "Node.UpdateDataFor", node.Addr, &tmpdata)
 		node.dataLock.Lock()
-		node.RemoteCall(node.fingerTable[0], "Node.UpdateDataFor", node.Addr, &node.data)
+		node.data = tmpdata
 		node.dataLock.Unlock()
 
-		node.dataLock.RLock()
-		node.RemoteCall(node.fingerTable[0], "Node.BackupDataFrom", node.data, nil)
-		node.dataLock.RUnlock()
-		node.fingerTableLock.RUnlock()
+		node.RemoteCall(*successor, "Node.BackupDataFrom", tmpdata, nil)
 
 		node.predecessorLock.Lock()
 		node.predecessor = ""
@@ -590,7 +583,7 @@ func (node *Node) Join(addr string) bool {
 
 		go node.Stablize()
 		go node.FixFinger()
-		// go node.test()
+		go node.test()
 
 		return true
 	} else {
@@ -603,7 +596,6 @@ func (node *Node) Quit() {
 	if !node.online {
 		return
 	}
-
 	node.innetLock.Lock()
 	node.innet = false
 	node.innetLock.Unlock()
@@ -622,8 +614,9 @@ func (node *Node) Quit() {
 		node.RemoteCall(successor, "Node.MergeBackupData", new(string), nil)
 
 		node.backupdataLock.RLock()
-		node.RemoteCall(successor, "Node.BackupDataFrom", node.backupdata, nil)
+		tmpbackupdata := node.backupdata
 		node.backupdataLock.RUnlock()
+		node.RemoteCall(successor, "Node.BackupDataFrom", tmpbackupdata, nil)
 
 		if predecessor != "" {
 			node.RemoteCall(successor, "Node.ChangePredecessor", predecessor, nil)
@@ -631,6 +624,7 @@ func (node *Node) Quit() {
 		}
 	}
 
+	node.threadfinished.Wait()
 	node.StopRPCServer()
 }
 
@@ -643,6 +637,9 @@ func (node *Node) ForceQuit() {
 	node.innetLock.Lock()
 	node.innet = false
 	node.innetLock.Unlock()
+	<-node.stablizefinished
+	<-node.fixfinished
+	node.threadfinished.Wait()
 
 	node.StopRPCServer()
 }
