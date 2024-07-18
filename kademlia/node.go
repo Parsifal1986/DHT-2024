@@ -22,7 +22,7 @@ const (
 	alpha      int = 3
 	tExpire        = 86400 * time.Second
 	tRefresh       = 5 * time.Second
-	tReplicate     = 20 * time.Second
+	tReplicate     = 8 * time.Second
 	tRepublish     = 86400 * time.Second
 	timeout        = 10 * time.Second
 )
@@ -327,8 +327,14 @@ func (node *Node) IterativeFindNode(id big.Int) []string {
 		}
 	}
 
-	for queue.Len() > 0 || len(waitgroup) > 0 {
-		if queue.Len() > 0 {
+	for {
+		queueLock.RLock()
+		queuelen := queue.Len()
+		queueLock.RUnlock()
+		if queuelen <= 0 && len(waitgroup) <= 0 {
+			break
+		}
+		if queuelen > 0 {
 			waitgroup <- true
 
 			queueLock.Lock()
@@ -349,6 +355,7 @@ func (node *Node) IterativeFindNode(id big.Int) []string {
 				}
 
 				node.PingOther(target)
+				candidate = append(candidate, PQElement{*Distance(HashString(target), &id), target})
 
 				for _, val := range newcontact {
 					bookLock.RLock()
@@ -356,7 +363,6 @@ func (node *Node) IterativeFindNode(id big.Int) []string {
 					bookLock.RUnlock()
 					if !ok {
 						Element := PQElement{*Distance(HashString(val), &id), val}
-						candidate = append(candidate, Element)
 						queueLock.Lock()
 						heap.Push(&queue, Element)
 						queueLock.Unlock()
@@ -374,8 +380,8 @@ func (node *Node) IterativeFindNode(id big.Int) []string {
 	sort.Sort(candidate)
 
 	ret := make([]string, 0)
-	for _, val := range candidate {
-		ret = append(ret, val.value)
+	for i := 0; i < min(K, candidate.Len()); i++ {
+		ret = append(ret, candidate[i].value)
 	}
 
 	return ret
@@ -502,13 +508,17 @@ func (node *Node) Put(key string, value string) bool {
 func (node *Node) Get(key string) (bool, string) {
 	logrus.Infof("%s Get %s", node.Addr, key)
 
-	if value, ok := node.data[key]; ok {
+	node.dataLock.RLock()
+	value, ok := node.data[key]
+	node.dataLock.RUnlock()
+
+	if ok {
 		return ok, value.Data
 	}
 
-	ok, ret := node.IterativeFindValue(key)
-	logrus.Info("Get ", key, " ", ok)
-	return ok, ret
+	flag, ret := node.IterativeFindValue(key)
+	logrus.Info("Get ", key, " ", flag)
+	return flag, ret
 }
 
 func (node *Node) Delete(key string) bool {
