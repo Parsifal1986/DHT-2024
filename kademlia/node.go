@@ -316,7 +316,8 @@ func (node *Node) IterativeFindNode(id big.Int) []string {
 	for _, val := range node.FindNClose(id, K) {
 		flag := node.PingOther(val)
 		if queue.Len() < alpha {
-			if flag {
+			_, ok := book[val]
+			if flag && !ok {
 				Element := PQElement{*Distance(HashString(val), &id), val}
 				candidate = append(candidate, Element)
 				heap.Push(&queue, Element)
